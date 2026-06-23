@@ -29,11 +29,11 @@ WORDS = [
 
 GRID_ROWS = 4
 GRID_COLS = 4
-MODEL_NAME = "meta-llama/Llama-3.1-8B"
+MODEL_NAME = "meta-llama/Llama-3.2-3B-Instruct"
 LAYER = 26
-SEQ_LEN = 1400
+SEQ_LEN = 1024
 N_SEQUENCES = 16
-SMOOTHING_WINDOW = 30
+SMOOTHING_WINDOW = 48
 
 COLORS = [
     "#e41a1c", "#377eb8", "#4daf4a", "#984ea3",
@@ -223,20 +223,28 @@ def head_ablation_hook(
     activation: Float[Tensor, "batch seq n_heads d_head"],
     hook: HookPoint,
     head: int,
+    pos_mask: torch.Tensor = None,
 ) -> Float[Tensor, "batch seq n_heads d_head"]:
-    activation[:, :, head, :] = 0.0
+    if pos_mask is None:
+        activation[:, :, head, :] = 0.0
+    else:
+        # pos_mask: [batch, seq] boolean tensor
+        # Expand it to [batch, seq, d_head] to match activation[:, :, head, :]
+        mask = pos_mask.unsqueeze(-1).expand(-1, -1, activation.shape[-1])
+        activation[:, :, head, :][mask] = 0.0
     return activation
 
 
-def make_ablation_hooks(heads_to_ablate):
+def make_ablation_hooks(heads_to_ablate, pos_mask=None):
     """Return a list of (name, hook_fn) pairs that zero-ablate the given heads.
 
     heads_to_ablate: list of (layer, head) tuples.
+    pos_mask: boolean tensor of shape [batch, seq]. If True, ablates at that position.
     """
     return [
         (
             utils.get_act_name("z", layer),
-            functools.partial(head_ablation_hook, head=head),
+            functools.partial(head_ablation_hook, head=head, pos_mask=pos_mask),
         )
         for layer, head in heads_to_ablate
     ]
@@ -247,6 +255,7 @@ def make_ablation_hooks(heads_to_ablate):
 def setup_plotting():
     plt.style.use("science")
     plt.rcParams.update({
+        "text.usetex": False,
         "axes.spines.top": False,
         "axes.spines.right": False,
         "xtick.top": False,
