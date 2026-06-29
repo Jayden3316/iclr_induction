@@ -63,7 +63,7 @@ def compute_head_scores(model):
                 # position i attending to i - (REPEAT_LEN - 1)
                 offset = REPEAT_LEN - 1
                 diag = p.diagonal(offset=-offset)
-                induction_scores[layer, head] += diag[offset:].mean().item()
+                induction_scores[layer, head] += diag[1:].mean().item()
 
                 # Previous-token score: mean of offset-1 diagonal
                 diag_prev = p.diagonal(offset=-1)
