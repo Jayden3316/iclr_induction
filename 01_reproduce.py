@@ -15,6 +15,7 @@ from utils import (
     compute_class_means, compute_pca_directions, setup_plotting, save_figure,
     smooth, plotly_pca_layout, plotly_line_layout, plotly_pca_traces, save_plotly,
 )
+from utils import plot_attention_heatmaps
 
 DATA_DIR = "results/reproduce/data"
 PLOTS_DIR = "results/reproduce/plots"
@@ -66,7 +67,7 @@ def plot_accuracy_curve(all_accs):
 
 # ── Fig 2 Right: Class-mean PCA ───────────────────────────────────────────────
 
-def plot_class_mean_pca(grid, class_means, pca_dirs):
+def plot_class_mean_pca(grid, class_means, pca_dirs, title=None):
     """Scatter of 16 class-mean centroids with grid edges."""
     projected = class_means @ pca_dirs.T  # [16, 2]
 
@@ -106,8 +107,149 @@ def plot_class_mean_pca(grid, class_means, pca_dirs):
     # ── Plotly interactive ───────────────────────────────────────────────────
     pfig = go.Figure(data=plotly_pca_traces(projected, grid))
     pfig.update_layout(**plotly_pca_layout("PCA of per-node mean activations"))
-    save_plotly(pfig, PLOTS_DIR, "pca_class_means.html")
+    save_plotly(pfig, PLOTS_DIR, f"pca_class_means_{title}.html")
 
+
+import matplotlib.pyplot as plt
+import plotly.graph_objects as go
+
+
+def plot_class_mean_pca_3d(grid, class_means, pca_dirs, title=None):
+    """Scatter of 16 class-mean centroids with grid edges in 3D."""
+    # pca_dirs must now contain the top 3 principal components -> [3, d]
+    projected = class_means @ pca_dirs.T  # Shape: [16, 3]
+
+    # ── Matplotlib 3D Plot ───────────────────────────────────────────────────
+    fig = plt.figure(figsize=(6, 6))
+    ax = fig.add_subplot(111, projection="3d")
+
+    # Grid edges (gray dashed)
+    A = grid.build_adjacency_matrix()
+    for i in range(len(WORDS)):
+        for j in range(i + 1, len(WORDS)):
+            if A[i, j]:
+                ax.plot(
+                    [projected[i, 0].item(), projected[j, 0].item()],
+                    [projected[i, 1].item(), projected[j, 1].item()],
+                    [projected[i, 2].item(), projected[j, 2].item()],
+                    color="gray",
+                    alpha=0.3,
+                    linestyle="--",
+                    linewidth=0.5,
+                )
+
+    # Scatter + labels
+    for i, word in enumerate(WORDS):
+        x, y, z = (
+            projected[i, 0].item(),
+            projected[i, 1].item(),
+            projected[i, 2].item(),
+        )
+
+        ax.scatter(
+            x,
+            y,
+            z,
+            color=WORD_TO_COLOR[word],
+            s=120,
+            marker="*",
+            edgecolors="black",
+            linewidths=0.5,
+            zorder=5,
+        )
+
+        # ax.text is used instead of ax.annotate for 3D coordinate support
+        ax.text(
+            x,
+            y,
+            z,
+            word,
+            fontsize=8,
+            bbox=dict(facecolor="white", edgecolor="none", alpha=0.7),
+        )
+
+    ax.set_xlabel("PC1")
+    ax.set_ylabel("PC2")
+    ax.set_zlabel("PC3")
+    ax.set_title(
+        title or "3D PCA of per-node mean activations", fontsize=10
+    )
+
+    # Note: 'equal' aspect ratio isn't natively supported the same way in 3D across all MPL versions,
+    # but you can use ax.set_box_aspect((1,1,1)) to keep the bounding box square.
+    ax.set_box_aspect((1, 1, 1))
+
+    save_figure(fig, PLOTS_DIR, "pca_class_means_3d.pdf")
+    print("Saved pca_class_means_3d")
+
+    # ── Plotly Interactive 3D Plot ───────────────────────────────────────────
+    plotly_traces = []
+
+    # 1. Build 3D lines for edges
+    edge_x, edge_y, edge_z = [], [], []
+    for i in range(len(WORDS)):
+        for j in range(i + 1, len(WORDS)):
+            if A[i, j]:
+                edge_x.extend(
+                    [projected[i, 0].item(), projected[j, 0].item(), None]
+                )
+                edge_y.extend(
+                    [projected[i, 1].item(), projected[j, 1].item(), None]
+                )
+                edge_z.extend(
+                    [projected[i, 2].item(), projected[j, 2].item(), None]
+                )
+
+    plotly_traces.append(
+        go.Scatter3d(
+            x=edge_x,
+            y=edge_y,
+            z=edge_z,
+            mode="lines",
+            line=dict(color="gray", width=1.5),
+            opacity=0.3,
+            hoverinfo="skip",
+        )
+    )
+
+    # 2. Build 3D scatter points
+    xs = [projected[i, 0].item() for i in range(len(WORDS))]
+    ys = [projected[i, 1].item() for i in range(len(WORDS))]
+    zs = [projected[i, 2].item() for i in range(len(WORDS))]
+    colors = [WORD_TO_COLOR[word] for word in WORDS]
+
+    plotly_traces.append(
+        go.Scatter3d(
+            x=xs,
+            y=ys,
+            z=zs,
+            mode="markers+text",
+            marker=dict(
+                size=10,
+                color=colors,
+                symbol="star",
+                line=dict(color="black", width=1),
+            ),
+            text=WORDS,
+            textposition="top center",
+            hoverinfo="text",
+        )
+    )
+
+    # 3. Create figure and apply 3D layout scene
+    pfig = go.Figure(data=plotly_traces)
+    pfig.update_layout(
+        title=title or "3D PCA of per-node mean activations",
+        scene=dict(
+            xaxis_title="PC1",
+            yaxis_title="PC2",
+            zaxis_title="PC3",
+            aspectmode="cube",
+        ),
+        margin=dict(l=0, r=0, b=0, t=40),
+    )
+
+    save_plotly(pfig, PLOTS_DIR, f"pca_class_means_3d_{title}.html")
 
 # ── Fig 6: Bigram PCA ─────────────────────────────────────────────────────────
 
@@ -247,6 +389,7 @@ def main():
         activations = pca_data["activations"]
         class_means = pca_data["class_means"]
         pca_dirs = pca_data["pca_dirs"]
+        print(f"{pca_dirs.shape=}")
         with open(seq_path) as f:
             sequence = json.load(f)
     else:
@@ -268,7 +411,7 @@ def main():
         sequence = grid.generate_sequence(SEQ_LEN)
         activations_t = get_activations(model, sequence, LAYER, N_LOOKBACK)
         class_means_t = compute_class_means(activations_t, sequence, WORDS, N_LOOKBACK)
-        pca_dirs_t = compute_pca_directions(class_means_t, top_n=2)
+        pca_dirs_t = compute_pca_directions(class_means_t, top_n=3)
 
         activations = activations_t.cpu().numpy()
         class_means = class_means_t.cpu().numpy()
@@ -280,9 +423,14 @@ def main():
         print(f"Cached {pca_path}")
 
     # ── Plotting ──────────────────────────────────────────────────────────────
-    plot_accuracy_curve(all_accs)
+    # plot_accuracy_curve(all_accs)
     plot_class_mean_pca(grid, class_means, pca_dirs)
+    plot_class_mean_pca_3d(grid, class_means, pca_dirs)
+
     plot_bigram_pca(grid, sequence, activations, class_means, pca_dirs)
+
+    print(f"{len(sequence)=}")
+    print(f"{sequence=}")
 
 
 if __name__ == "__main__":

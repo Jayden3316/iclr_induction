@@ -10,3 +10,10 @@ __pycache__/
 
 results/
 *.html
+
+results/
+reproduce/
+entrypoints/
+Dockerfile
+.env
+

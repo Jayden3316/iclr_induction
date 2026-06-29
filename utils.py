@@ -5,6 +5,7 @@ import os
 import random
 import functools
 
+from matplotlib.colors import LogNorm
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
@@ -15,7 +16,7 @@ from torch import Tensor
 from jaxtyping import Float
 from transformer_lens import HookedTransformer, utils
 from transformer_lens.hook_points import HookPoint
-
+from model import TransformerConfig, Transformer
 torch.set_grad_enabled(False)
 
 # ── Constants ──────────────────────────────────────────────────────────────────
@@ -30,8 +31,8 @@ WORDS = [
 GRID_ROWS = 4
 GRID_COLS = 4
 MODEL_NAME = "meta-llama/Llama-3.2-3B-Instruct"
-LAYER = 26
-SEQ_LEN = 1024
+LAYER = 0
+SEQ_LEN = 64
 N_SEQUENCES = 16
 SMOOTHING_WINDOW = 48
 
@@ -81,9 +82,27 @@ class Grid:
             sequence.append(self.grid[row][col])
         return sequence
 
-    def generate_batch(self, seq_len):
-        """16 sequences, each starting at a different grid word."""
-        return [self.generate_sequence(seq_len, start_word=w) for w in self.words]
+    # def generate_batch(self, seq_len):
+    #     """16 sequences, each starting at a different grid word."""
+    #     return [self.generate_sequence(seq_len, start_word=w) for w in self.words]
+
+    def generate_batch(self, seq_len, n_sequences):
+        """
+        Generate a batch of random-walk sequences.
+
+        Start words are assigned cyclically so that all grid words
+        appear approximately equally often as starting points.
+        """
+        sequences = []
+
+        for i in range(n_sequences):
+            start_word = self.words[i % len(self.words)]
+            sequences.append(
+                self.generate_sequence(seq_len, start_word=start_word)
+            )
+
+        return sequences
+    
 
     # ── adjacency ──────────────────────────────────────────────────────────
 
@@ -120,12 +139,13 @@ class Grid:
 
 # ── Seeding ────────────────────────────────────────────────────────────────────
 
-def set_seed(seed: int):
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    random.seed(seed)
-    np.random.seed(seed)
-
+def set_seed(seed, model_seed):
+    if seed:
+        random.seed(seed)
+        np.random.seed(seed)
+    if model_seed:
+        torch.manual_seed(model_seed)
+        torch.cuda.manual_seed_all(model_seed)
 
 # ── Model loading ──────────────────────────────────────────────────────────────
 
@@ -138,6 +158,49 @@ def load_model(cache_dir=None, device=None):
         MODEL_NAME, device=device, cache_dir=cache_dir,
     )
 
+from transformer_lens import HookedTransformer, HookedTransformerConfig
+
+def load_toy_model(device=None):
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    # Define a small 1-layer, 4-head attention-only model
+    cfg = HookedTransformerConfig(
+        n_layers=1,
+        n_heads=4,
+        d_model=128,
+        d_head=32,
+        n_ctx=SEQ_LEN,
+        d_vocab=len(WORDS),
+        act_fn=None,
+        attention_dir="causal",
+        attn_only=True,
+        device=device,
+        seed=42,
+        normalization_type=None,
+    )
+    return HookedTransformer(cfg)
+
+
+def load_JaydenModel(device=None):
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    cfg = TransformerConfig(
+        d_vocab=len(WORDS),
+        d_model=128,
+        n_heads=1,
+        d_head=128,
+        n_layers=1,
+        n_ctx=SEQ_LEN,
+        d_mlp=512,
+        attn_only=True,
+        use_layernorm=False,
+        use_bias=False,
+        pos_embed="rope",
+        use_causal_mask=True,
+        model_seed=42,
+    )
+    return Transformer(cfg).to(device)
 
 # ── Tokenization ──────────────────────────────────────────────────────────────
 
@@ -145,6 +208,12 @@ def tokenize_sequence(model, sequence):
     """Tokenize a word sequence. Returns input_ids tensor."""
     text = " " + " ".join(sequence)
     return model.tokenizer(text, return_tensors="pt").input_ids
+
+
+def simple_tokenize(sequence, vocab):
+    # Map words to IDs, default to 0 if word is unknown
+    tokens = [vocab.get(word, 0) for word in sequence.split()]
+    return torch.tensor([tokens], dtype=torch.long)
 
 
 # ── Accuracy ───────────────────────────────────────────────────────────────────
@@ -187,6 +256,56 @@ def get_activations(model, sequence, layer, n_lookback, fwd_hooks=[]):
     return acts[-n_lookback:, :]  # [n_lookback, d_model]
 
 
+import torch
+from transformer_lens import utils
+
+def get_activations_toy_batch(model, sequences, layer, n_lookback, act_type="attn_out"):
+    """
+    Returns the last n_lookback activations for a BATCH of sequences.
+    Output shape: [batch_size, n_lookback, d_model]
+    """
+    word_to_id = {word: i for i, word in enumerate(WORDS)}
+    
+    # Map all sequences in the batch to token IDs
+    token_ids = [[word_to_id[word] for word in seq] for seq in sequences]
+    tokens = torch.tensor(token_ids, dtype=torch.long).to(model.cfg.device)
+    
+    # Define the hook point
+    from transformer_lens import utils
+    hook_name = utils.get_act_name(act_type, layer)
+    
+    # Run with cache
+    _, cache = model.run_with_cache(tokens, names_filter=[hook_name])
+    acts = cache[hook_name] # Shape: [batch_size, seq_len, d_model]
+    
+    # Return the last n_lookback positions for ALL sequences in the batch
+    # We drop the hardcoded acts[0] so we don't lose the batch dimension
+    return acts[:, -n_lookback:, :]
+
+def get_activations_Jayden_batch(model, sequences, layer, n_lookback):
+
+    word_to_id = {word: i for i, word in enumerate(WORDS)}
+    
+    # Map all sequences in the batch to token IDs
+    token_ids = [[word_to_id[word] for word in seq] for seq in sequences]
+    tokens = torch.tensor(token_ids, dtype=torch.long)
+
+    attn_output = []
+    def hook_fn(module, input, output):
+        attn_output.append(output[0])  
+
+    hook_handle = model.blocks[0].attn.register_forward_hook(hook_fn)
+
+    with torch.no_grad():
+        model(tokens)
+
+    hook_handle.remove()
+    sub_attn_out = attn_output[0]
+    # Slice suffix
+    sub_last_attn = sub_attn_out[:, -n_lookback:, :]
+
+    return sub_last_attn
+
 # ── PCA helpers ────────────────────────────────────────────────────────────────
 
 def compute_class_means(
@@ -205,6 +324,46 @@ def compute_class_means(
         else:
             means.append(torch.zeros(activations.shape[-1], device=activations.device))
     return torch.stack(means)  # [16, d_model]
+
+
+def compute_class_means_batch(activations_t, sequences, words, n_lookback):
+    """
+    Computes the mean activation vector for each word, averaging over all 
+    occurrences across the lookback window AND the entire batch.
+    
+    activations_t: Tensor of shape [batch_size, n_lookback, d_model]
+    sequences: List of lists of words, shape [batch_size, seq_len]
+    """
+    batch_size, n_look, d_model = activations_t.shape
+    
+    # Dictionary to collect activation vectors for each word
+    word_vectors = {word: [] for word in words}
+    
+    # Loop over every sequence in the batch
+    for b in range(batch_size):
+        # Get the last n_lookback words for this specific sequence
+        lookback_words = sequences[b][-n_look:] 
+        
+        # Match each lookback word with its corresponding activation vector
+        for l in range(n_look):
+            word = lookback_words[l]
+            if word in word_vectors:
+                word_vectors[word].append(activations_t[b, l, :])
+                
+    print(f"{word_vectors.keys()=}")
+    # Compute the mean vector for each word across all batch occurrences
+    class_means = []
+    for word in words:
+        vectors = word_vectors[word]
+        if len(vectors) > 0:
+            # Stack all collected occurrences and average them
+            mean_vec = torch.stack(vectors).mean(dim=0)
+        else:
+            # Fallback tensor if a word never appeared in the lookback windows
+            mean_vec = torch.zeros(d_model, device=activations_t.device)
+        class_means.append(mean_vec)
+        
+    return torch.stack(class_means) # Shape: [len(words), d_model]
 
 
 def compute_pca_directions(
@@ -359,3 +518,108 @@ def plotly_pca_traces(projected, grid, words=WORDS, word_to_color=WORD_TO_COLOR)
             showlegend=False,
         ))
     return traces
+
+import math
+
+
+def plot_attention_heatmaps(model, sequences, layer: int = 0, seq_index: int = 0,
+                                cmap: str = 'viridis', vmin=None, vmax=None,
+                                use_log_scale: bool = False, log_eps: float = 1e-12,
+                                figsize=(20,16), save_path: str = None, show: bool = False):
+    """
+    Extracts and plots attention heatmaps for every head in a chosen layer 
+    for our toy word-based transformer setup.
+    
+    sequences: List of lists of strings (e.g., [['The', 'cat', 'sat'], ...])
+    """
+    # 1. Convert string sequences to token IDs for the model
+    word_to_id = {word: i for i, word in enumerate(WORDS)}
+    token_ids = [[word_to_id[word] for word in seq] for seq in sequences]
+    tokens = torch.tensor(token_ids, dtype=torch.long).to(model.cfg.device)
+    
+    # 2. Extract attention patterns from TransformerLens cache
+    # hook_pattern shape is [batch, n_heads, query_pos, key_pos]
+    hook_name = f"blocks.{layer}.attn.hook_pattern"
+    _, cache = model.run_with_cache(tokens, names_filter=[hook_name])
+    
+    # Convert to numpy and select our specific sequence index
+    layer_w = cache[hook_name].cpu().numpy()  # [batch, n_heads, T, T]
+    
+    batch, n_heads, T, _ = layer_w.shape
+    print(f"{seq_index=}")
+    if seq_index < 0 or seq_index >= batch:
+        raise IndexError(f"seq_index out of range (0..{batch-1})")
+        
+    seq_w = layer_w[seq_index]  # [n_heads, T, T]
+    
+    # 3. Use the original string words as labels for the axes!
+    labels = sequences[seq_index]
+
+    # Grid layout calculations
+    cols = min(4, n_heads) # Kept at 4 max for cleaner display of word labels
+    rows = int(math.ceil(n_heads / cols))
+    if figsize is None:
+        figsize = (cols * 4.5, rows * 4.5)
+
+    fig, axes = plt.subplots(rows, cols, figsize=figsize, constrained_layout=True)
+    # Ensure axes is always a 2D array even if it's 1x1 or 1xN
+    if n_heads == 1:
+        axes = np.array([[axes]])
+    elif rows == 1 or cols == 1:
+        axes = np_atleast_2d_flat = np.atleast_2d(axes) 
+    else:
+        axes = np.atleast_2d(axes)
+
+    # Log scaling calculations
+    if use_log_scale:
+        pos = seq_w[seq_w > 0]
+        if pos.size > 0:
+            auto_vmin = float(pos.min())
+            auto_vmax = float(seq_w.max())
+            vmin_used = (vmin if (vmin is not None and vmin > 0) else auto_vmin)
+            vmax_used = (vmax if (vmax is not None and vmax > 0) else auto_vmax)
+            norm = LogNorm(vmin=max(vmin_used, log_eps), vmax=max(vmax_used, log_eps))
+        else:
+            norm = None
+    else:
+        norm = None
+
+    # Plot each attention head
+    for h in range(n_heads):
+        r = h // cols
+        c = h % cols
+        ax = axes[r, c]
+        
+        imshow_kwargs = dict(aspect='equal', cmap=cmap, interpolation='nearest')
+        if norm is not None:
+            imshow_kwargs['norm'] = norm
+        else:
+            if vmin is not None: imshow_kwargs['vmin'] = vmin
+            if vmax is not None: imshow_kwargs['vmax'] = vmax
+
+        im = ax.imshow(seq_w[h], **imshow_kwargs)
+        ax.set_title(f"Layer {layer} | Head {h}", fontsize=11, fontweight='bold')
+        
+        # Apply the actual word string labels to the axes
+        ax.set_xticks(np.arange(T))
+        ax.set_yticks(np.arange(T))
+        ax.set_xticklabels(labels, fontsize=9, rotation=45, ha="right")
+        ax.set_yticklabels(labels, fontsize=9)
+        
+        ax.set_xlabel('Key Token (What it attends to)', fontsize=9)
+        ax.set_ylabel('Query Token (What is looking)', fontsize=9)
+            
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    # Turn off any empty subplots in the grid
+    for h in range(n_heads, rows * cols):
+        r = h // cols
+        c = h % cols
+        axes[r, c].axis('off')
+
+    if save_path:
+        plt.savefig(save_path)
+    if show:
+        plt.show()
+    plt.close(fig)
+    return fig
