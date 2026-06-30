@@ -15,11 +15,11 @@ from utils import (
 )
 
 LAYER=0
-SEQ_LEN= 64
+SEQ_LEN= 16
 PLOTS_DIR = "results/random-transformer/plots"
 N_LOOKBACK = 50
 print(f"{SEQ_LEN=}, {N_LOOKBACK=}")
-BATCH_SIZE = 16
+BATCH_SIZE = 256
 
 
 
@@ -222,8 +222,8 @@ def main():
     print(model)
 
     # generate data
-    seed = 1
-    set_seed(seed)
+    seed = None
+    set_seed(seed, model_seed=42)
     sequences = grid.generate_batch(SEQ_LEN, BATCH_SIZE)
     print(f"{len(sequences)=}")
     print(f"{sequences=}")
